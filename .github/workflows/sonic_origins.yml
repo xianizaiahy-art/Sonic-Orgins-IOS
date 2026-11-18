@@ -1,0 +1,119 @@
+name: Sonic Origins - IPA (No-BC)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GAME_NAME: Sonic_Origins
+  # Set to the number of DLC NSPs you have. Set to 0 if you have none.
+  # Sonic Origins Plus content may be bundled in the update or shipped as DLC
+  # depending on your dump, so check your own files and set this accordingly.
+  EXPECTED_DLC_COUNT: "0"
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out NXNative No-BC
+        uses: actions/checkout@v4
+        with:
+          repository: mianmuhammadse/nxnative
+          ref: no-bc
+          path: nxnative
+
+      - name: Check available disk space
+        run: df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.2.app
+          xcodebuild -version
+          xcodebuild -downloadComponent MetalToolchain
+          brew update
+          brew install python@3.12 xcodegen zstd glslang
+          echo "$(brew --prefix python@3.12)/bin" >> "$GITHUB_PATH"
+
+      - name: Install Python dependencies
+        run: |
+          python3.12 -m venv "$RUNNER_TEMP/nx-venv"
+          "$RUNNER_TEMP/nx-venv/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/nx-venv/bin/python" -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic backports.zstd gdown
+
+      - name: Download base, update, DLCs and keys
+        env:
+          BASE_URL: ${{ secrets.SONIC_ORIGINS_BASE_NSP_URL }}
+          UPDATE_URL: ${{ secrets.SONIC_ORIGINS_UPDATE_NSP_URL }}
+          DLC_FOLDER_URL: ${{ secrets.SONIC_ORIGINS_DLC_FOLDER_URL }}
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+        run: |
+          set -euo pipefail
+          GAME_DIR="$RUNNER_TEMP/sonic_origins"
+          DLC_DIR="$RUNNER_TEMP/sonic_origins-dlc-download"
+          mkdir -p "$GAME_DIR" "$DLC_DIR"
+
+          for name in BASE_URL PROD_KEYS; do
+            test -n "${!name}" || { echo "Missing required secret: $name"; exit 1; }
+          done
+
+          "$RUNNER_TEMP/nx-venv/bin/gdown" "$BASE_URL" -O "$GAME_DIR/Sonic_Origins_Base.nsp"
+          EXPECTED_TOTAL=1
+          if [ -n "$UPDATE_URL" ]; then
+            "$RUNNER_TEMP/nx-venv/bin/gdown" "$UPDATE_URL" -O "$GAME_DIR/Sonic_Origins_Update.nsp"
+            test -s "$GAME_DIR/Sonic_Origins_Update.nsp"
+            EXPECTED_TOTAL=2
+          else
+            echo "No update URL provided, building base game only."
+          fi
+          if [ "$EXPECTED_DLC_COUNT" -gt 0 ]; then
+            test -n "$DLC_FOLDER_URL" || { echo "Missing required secret: DLC_FOLDER_URL"; exit 1; }
+            "$RUNNER_TEMP/nx-venv/bin/gdown" --folder "$DLC_FOLDER_URL" -O "$DLC_DIR"
+
+            DLC_COUNT="$(find "$DLC_DIR" -type f -iname '*.nsp' | wc -l | tr -d ' ')"
+            echo "DLC NSP files found: $DLC_COUNT"
+            test "$DLC_COUNT" = "$EXPECTED_DLC_COUNT" || {
+              echo "Expected $EXPECTED_DLC_COUNT DLC NSP files, found $DLC_COUNT."
+              echo "Check that all files are directly accessible with Anyone with the link - Viewer."
+              exit 1
+            }
+            find "$DLC_DIR" -type f -iname '*.nsp' -exec cp {} "$GAME_DIR/" \;
+            EXPECTED_TOTAL=$((EXPECTED_TOTAL + EXPECTED_DLC_COUNT))
+          fi
+
+          printf '%s' "$PROD_KEYS" > "$RUNNER_TEMP/prod.keys"
+          TOTAL_COUNT="$(find "$GAME_DIR" -maxdepth 1 -type f -iname '*.nsp' | wc -l | tr -d ' ')"
+          echo "Total NSP files prepared: $TOTAL_COUNT"
+          test "$TOTAL_COUNT" = "$EXPECTED_TOTAL"
+          test -s "$GAME_DIR/Sonic_Origins_Base.nsp"
+          test -s "$RUNNER_TEMP/prod.keys"
+          ls -lh "$GAME_DIR"
+
+      - name: Build unsigned Sonic Origins IPA
+        working-directory: nxnative
+        env:
+          # Texture-compression workaround. Was tuned for Dragon Ball; Sonic Origins
+          # is mostly 2D, so this may be unnecessary. Remove if the build complains.
+          DM_NO_BC_ASTC: all
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/nx-venv/bin/python" scripts/build_ipa_from_nsp.py "$RUNNER_TEMP/sonic_origins" -k "$RUNNER_TEMP/prod.keys" --allow-other-metal -o "$RUNNER_TEMP/Sonic-Origins.ipa"
+
+      - name: Upload unsigned IPA and build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonic-origins-unsigned-ipa
+          path: |
+            ${{ runner.temp }}/Sonic-Origins.ipa
+            ${{ runner.temp }}/sonic_origins/*_build/logs/**
+            ${{ runner.temp }}/sonic_origins/*_build/profile/**
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Remove temporary keys
+        if: always()
+        run: rm -f "$RUNNER_TEMP/prod.keys"
